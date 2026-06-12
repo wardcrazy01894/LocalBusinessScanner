@@ -72,6 +72,11 @@ def scan(
         "--skip-check",
         help="Fetch business data only; skip website quality checks.",
     ),
+    include_chains: bool = typer.Option(
+        False,
+        "--include-chains",
+        help="Include chain businesses and non-leads (churches, schools) in stats.",
+    ),
     refresh: bool = typer.Option(
         False,
         "--refresh",
@@ -155,7 +160,7 @@ def scan(
             console.print("[dim]No new websites to check (all fresh or none listed).[/dim]\n")
 
     # Summary
-    reporter_mod.print_stats(conn)
+    reporter_mod.print_stats(conn, filter_chains=not include_chains)
     conn.close()
 
 
@@ -163,7 +168,7 @@ def scan(
 def report(
     report_type: str = typer.Argument(
         "all",
-        help='"no-website", "poor-website", or "all".',
+        help='"no-website", "poor-website", "social-only", or "all".',
     ),
     output_dir: Optional[Path] = typer.Option(
         None,
@@ -178,6 +183,11 @@ def report(
         min=0,
         max=100,
     ),
+    include_chains: bool = typer.Option(
+        False,
+        "--include-chains",
+        help="Include chain businesses and non-leads (churches, schools) in the CSV.",
+    ),
     env_file: Optional[Path] = typer.Option(
         None,
         "--env-file",
@@ -188,7 +198,11 @@ def report(
 
     "no-website"   — businesses with no website found.
     "poor-website" — businesses with website quality score < THRESHOLD.
-    "all"          — generate both reports (default).
+    "social-only"  — businesses using Facebook/Instagram/Yelp as their 'website'.
+    "all"          — generate all three reports (default).
+
+    Chains and non-leads (churches, schools, government) are filtered out
+    by default. Pass --include-chains to keep them.
     """
     from . import db as db_mod
     from . import reporter as reporter_mod
@@ -198,20 +212,33 @@ def report(
     conn = db_mod.get_connection(cfg.db_path)
     db_mod.init_schema(conn)
     out = output_dir or cfg.reports_dir
+    fc = not include_chains
 
     if report_type in ("no-website", "all"):
-        path = reporter_mod.generate_no_website_report(conn, out)
-        console.print(f"[green]✓[/green] No-website leads: [cyan]{path}[/cyan]")
+        path, kept, skipped = reporter_mod.generate_no_website_report(conn, out, filter_chains=fc)
+        note = f" ({skipped} chains/non-leads excluded)" if skipped else ""
+        console.print(f"[green]✓[/green] No-website leads: [cyan]{path}[/cyan] — {kept} businesses{note}")
+
+    if report_type in ("social-only", "all"):
+        path, kept, skipped = reporter_mod.generate_social_only_report(conn, out, filter_chains=fc)
+        note = f" ({skipped} chains/non-leads excluded)" if skipped else ""
+        console.print(f"[green]✓[/green] Social-only leads: [cyan]{path}[/cyan] — {kept} businesses{note}")
 
     if report_type in ("poor-website", "all"):
-        path = reporter_mod.generate_poor_website_report(conn, out, score_threshold)
-        console.print(f"[green]✓[/green] Poor-website leads: [cyan]{path}[/cyan]")
+        path, kept, skipped = reporter_mod.generate_poor_website_report(conn, out, score_threshold, filter_chains=fc)
+        note = f" ({skipped} chains/non-leads excluded)" if skipped else ""
+        console.print(f"[green]✓[/green] Poor-website leads: [cyan]{path}[/cyan] — {kept} businesses{note}")
 
     conn.close()
 
 
 @app.command()
 def stats(
+    include_chains: bool = typer.Option(
+        False,
+        "--include-chains",
+        help="Include chain businesses and non-leads in counts.",
+    ),
     env_file: Optional[Path] = typer.Option(
         None,
         "--env-file",
@@ -226,5 +253,5 @@ def stats(
     cfg = load_config(env_file)
     conn = db_mod.get_connection(cfg.db_path)
     db_mod.init_schema(conn)
-    reporter_mod.print_stats(conn)
+    reporter_mod.print_stats(conn, filter_chains=not include_chains)
     conn.close()

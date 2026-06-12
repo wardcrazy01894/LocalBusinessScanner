@@ -55,6 +55,7 @@ class WebsiteCheckResult:
     score: int
     http_status: Optional[int]
     error_msg: Optional[str]
+    is_social: bool = False  # True if URL is a social media / directory page
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +94,8 @@ CREATE TABLE IF NOT EXISTS website_checks (
     has_meta_desc INTEGER NOT NULL,
     score        INTEGER NOT NULL,
     http_status  INTEGER,
-    error_msg    TEXT
+    error_msg    TEXT,
+    is_social    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_wc_place_id   ON website_checks(place_id);
@@ -117,8 +119,17 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Create tables and indexes if they do not already exist (idempotent)."""
+    """Create tables and indexes if they do not already exist (idempotent).
+
+    Also applies lightweight migrations for columns added after v0.
+    """
     conn.executescript(_SCHEMA)
+    # Migration: add is_social column if an older DB doesn't have it
+    try:
+        conn.execute("ALTER TABLE website_checks ADD COLUMN is_social INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +253,8 @@ def insert_website_check(conn: sqlite3.Connection, result: WebsiteCheckResult) -
         """
         INSERT INTO website_checks
             (place_id, checked_at, reachable, has_ssl, has_viewport, load_time_ms,
-             has_title, has_meta_desc, score, http_status, error_msg)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             has_title, has_meta_desc, score, http_status, error_msg, is_social)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             result.place_id,
@@ -257,6 +268,7 @@ def insert_website_check(conn: sqlite3.Connection, result: WebsiteCheckResult) -
             result.score,
             result.http_status,
             result.error_msg,
+            int(result.is_social),
         ),
     )
 
@@ -283,6 +295,7 @@ def get_latest_check(
         score=row["score"],
         http_status=row["http_status"],
         error_msg=row["error_msg"],
+        is_social=bool(row["is_social"]) if row["is_social"] is not None else False,
     )
 
 

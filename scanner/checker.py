@@ -40,6 +40,42 @@ POOR_WEBSITE_THRESHOLD: int = 40
 
 _USER_AGENT = "LocalBusinessScanner/0.1"
 
+# Domains that are social media / directory pages, not real business websites.
+# A business "website" pointing here means they have no real site of their own.
+_SOCIAL_DOMAINS: frozenset[str] = frozenset({
+    "facebook.com", "www.facebook.com", "m.facebook.com",
+    "instagram.com", "www.instagram.com",
+    "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+    "tiktok.com", "www.tiktok.com",
+    "yelp.com", "www.yelp.com",
+    "tripadvisor.com", "www.tripadvisor.com",
+    "google.com", "www.google.com", "maps.google.com",
+    "maps.app.goo.gl",
+    "goo.gl",
+    "linktr.ee",
+    "linktree.com",
+    "nextdoor.com", "www.nextdoor.com",
+    "foursquare.com", "www.foursquare.com",
+    "yellowpages.com", "www.yellowpages.com",
+    "bbb.org", "www.bbb.org",
+    "angieslist.com", "www.angieslist.com",
+    "houzz.com", "www.houzz.com",
+    "thumbtack.com", "www.thumbtack.com",
+})
+
+
+def is_social_url(url: str) -> bool:
+    """Return True if the URL points to a social media or directory page.
+
+    These are not real business websites — the business has no site of their own.
+    """
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url.lower()).netloc.lstrip("www.")
+        return host in {d.lstrip("www.") for d in _SOCIAL_DOMAINS}
+    except Exception:
+        return False
+
 
 async def run_checks(
     cfg: Config,
@@ -85,6 +121,24 @@ async def check_website(
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    # Step 0a: check if URL is a social media / directory page before fetching
+    social = is_social_url(url)
+    if social:
+        return WebsiteCheckResult(
+            place_id=place_id,
+            checked_at=datetime.utcnow(),
+            reachable=True,   # it exists, just not a real website
+            has_ssl=url.startswith("https://"),
+            has_viewport=False,
+            load_time_ms=None,
+            has_title=False,
+            has_meta_desc=False,
+            score=0,          # treated same as no website for lead purposes
+            http_status=None,
+            error_msg="Social/directory page — not a real website",
+            is_social=True,
+        )
+
     async with semaphore:
         t0 = time.monotonic()
         try:
@@ -94,6 +148,24 @@ async def check_website(
             final_url = str(resp.url)
             has_ssl = final_url.startswith("https://")
             reachable = 200 <= resp.status_code < 400
+
+            # Check if we were redirected to a social page
+            final_social = is_social_url(final_url)
+            if final_social:
+                return WebsiteCheckResult(
+                    place_id=place_id,
+                    checked_at=datetime.utcnow(),
+                    reachable=True,
+                    has_ssl=has_ssl,
+                    has_viewport=False,
+                    load_time_ms=load_ms,
+                    has_title=False,
+                    has_meta_desc=False,
+                    score=0,
+                    http_status=resp.status_code,
+                    error_msg=f"Redirects to social/directory page ({final_url})",
+                    is_social=True,
+                )
 
             metrics = _extract_metrics(resp.text) if reachable else {}
 
@@ -118,6 +190,7 @@ async def check_website(
                 score=score,
                 http_status=resp.status_code,
                 error_msg=None,
+                is_social=False,
             )
 
         except httpx.SSLError as exc:
