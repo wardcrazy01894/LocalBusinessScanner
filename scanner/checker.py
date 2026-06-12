@@ -193,8 +193,8 @@ async def check_website(
                 is_social=False,
             )
 
-        except httpx.SSLError as exc:
-            return _error_result(place_id, f"SSLError: {exc}")
+        except httpx.ConnectError as exc:
+            return _error_result(place_id, f"ConnectError: {exc}")
         except httpx.TimeoutException:
             return _error_result(place_id, "Timeout")
         except Exception as exc:
