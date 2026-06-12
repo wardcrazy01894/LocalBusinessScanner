@@ -3,17 +3,21 @@ scanner/cli.py — Typer CLI command definitions.
 
 Commands: scan, report, stats
 
+Data source is chosen automatically:
+  - GOOGLE_MAPS_API_KEY set  → Google Places (best coverage, ~$0.95/POC)
+  - GOOGLE_MAPS_API_KEY unset → Overpass/OSM + Yelp (free, less coverage)
+
 Wiring order in scan:
-  1. load_config()
+  1. load_config() — determines data source
   2. get_connection() + init_schema()
-  3. places.fetch_area() → DB writes (stubs + details)
+  3. places.fetch_area() OR free_sources.fetch_area_free() → DB writes
   4. db.get_businesses_needing_check() → list[Business]
   5. asyncio.run(checker.run_checks()) → list[WebsiteCheckResult]
   6. Transaction: insert_website_check() + update_last_checked_at() per result
   7. reporter.print_stats()
 
-All DB writes happen synchronously on the main thread (step 6 is wrapped
-in a single BEGIN/commit so a partial failure doesn't leave stale state).
+All DB writes happen synchronously on the main thread. Step 6 is wrapped
+in a single BEGIN/commit so a partial failure doesn't leave stale state.
 
 Milestone: M4-A
 """
@@ -46,16 +50,16 @@ def scan(
     radius_km: float = typer.Option(
         1.0,
         "--radius-km",
-        help="Search radius in kilometres. Default 1.0 km (POC-safe, ~$0.95 total).",
+        help="Search radius in kilometres. Default 1.0 km (POC-safe).",
         min=0.1,
         max=50.0,
     ),
     max_results: int = typer.Option(
         50,
         "--max-results",
-        help="Maximum businesses to fetch (1–60). Default 50.",
+        help="Maximum businesses to fetch. Default 50. Google mode: max 60.",
         min=1,
-        max=60,
+        max=500,
     ),
     yes: bool = typer.Option(
         False,
@@ -66,12 +70,12 @@ def scan(
     skip_check: bool = typer.Option(
         False,
         "--skip-check",
-        help="Fetch Places data only; skip website quality checks.",
+        help="Fetch business data only; skip website quality checks.",
     ),
     refresh: bool = typer.Option(
         False,
         "--refresh",
-        help="[NOT IMPLEMENTED v0] Re-fetch Place Details for businesses already in DB.",
+        help="[NOT IMPLEMENTED v0] Re-fetch details for businesses already in DB.",
     ),
     env_file: Optional[Path] = typer.Option(
         None,
@@ -82,15 +86,13 @@ def scan(
 ) -> None:
     """Scan local businesses in AREA for web design leads.
 
-    Geocodes AREA, runs a Google Nearby Search within RADIUS_KM, fetches
-    Place Details (website + phone), checks website quality, and saves
-    everything to SQLite.
+    Auto-selects data source based on which API keys are in .env:
+      - Google Maps key set  → Google Places (best coverage, ~$0.95/50 biz)
+      - No Google key        → Overpass/OSM + Yelp (free, good for POC)
 
-    Cost estimate with defaults (50 businesses, 1 km): ~$0.95.
-    Re-runs are idempotent — already-fetched businesses are skipped.
+    Results are saved to SQLite. Re-runs skip already-fetched businesses.
     """
     from . import db as db_mod
-    from . import places as places_mod
     from . import checker as checker_mod
     from . import reporter as reporter_mod
     from .config import load_config
@@ -103,18 +105,34 @@ def scan(
     conn = db_mod.get_connection(cfg.db_path)
     db_mod.init_schema(conn)
 
+    # Show which data source will be used
+    source_style = "green" if cfg.use_google else "yellow"
     console.print(f"\n[bold cyan]LocalBusinessScanner[/bold cyan] — [bold]{area}[/bold]")
+    console.print(f"  data source: [{source_style}]{cfg.data_source_label}[/{source_style}]")
     console.print(f"  radius: {radius_km} km  |  max: {max_results} businesses\n")
 
-    # Phase 1: Places API
-    with console.status("[bold green]Fetching businesses from Google Places..."):
-        counts = places_mod.fetch_area(cfg, conn, area, radius_km, max_results, yes)
-
-    console.print(
-        f"[green]✓[/green] Places: {counts['searched']} found, "
-        f"{counts['new_stubs']} new, {counts['details_fetched']} details fetched, "
-        f"{counts['skipped']} already in DB\n"
-    )
+    # Phase 1: Discover businesses
+    if cfg.use_google:
+        # Enforce Google's 60-result cap
+        google_max = min(max_results, 60)
+        if max_results > 60:
+            console.print("[dim]  Note: Google Nearby Search is capped at 60 results. Use grid scan (v1) for more.[/dim]")
+        from . import places as places_mod
+        with console.status("[bold green]Fetching from Google Places..."):
+            counts = places_mod.fetch_area(cfg, conn, area, radius_km, google_max, yes)
+        console.print(
+            f"[green]✓[/green] Google: {counts['searched']} found, "
+            f"{counts['new_stubs']} new, {counts['details_fetched']} details fetched, "
+            f"{counts['skipped']} already in DB\n"
+        )
+    else:
+        from . import free_sources as fs_mod
+        with console.status("[bold yellow]Fetching from free sources..."):
+            counts = fs_mod.fetch_area_free(cfg, conn, area, radius_km, max_results, yes)
+        console.print(
+            f"[green]✓[/green] Free sources: {counts['searched']} found, "
+            f"{counts['new_stubs']} new, {counts['skipped']} already in DB\n"
+        )
 
     # Phase 2: Website checks
     if not skip_check:
@@ -134,7 +152,7 @@ def scan(
 
             console.print(f"[green]✓[/green] Checked {len(results)} websites\n")
         else:
-            console.print("[dim]No new websites to check (all fresh or no websites listed).[/dim]\n")
+            console.print("[dim]No new websites to check (all fresh or none listed).[/dim]\n")
 
     # Summary
     reporter_mod.print_stats(conn)
@@ -168,7 +186,7 @@ def report(
 ) -> None:
     """Generate CSV lead reports from the database.
 
-    "no-website"   — businesses with no website listed on Google.
+    "no-website"   — businesses with no website found.
     "poor-website" — businesses with website quality score < THRESHOLD.
     "all"          — generate both reports (default).
     """

@@ -2,56 +2,82 @@
 
 ## What this project does
 
-Lead-gen CLI for a web design business. Finds local businesses with no website (or a poor one) using Google Places API, checks website quality, and exports CSV reports of prospects to contact.
+Lead-gen CLI for a web design business. Finds local businesses with no website (or a poor one), checks website quality, and exports CSV reports of prospects to contact.
 
 ## Quick start for collaborators
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env          # add GOOGLE_MAPS_API_KEY
-python -m scanner scan "Highland, Utah"          # POC scan (~$0.95)
+cp .env.example .env          # see options below
+python -m scanner scan "Highland, Utah"          # auto-detects data source
 python -m scanner scan "St. Petersburg, Florida" --radius-km 2
 python -m scanner report
 python -m scanner stats
 ```
 
+**Free mode (no billing):** leave `GOOGLE_MAPS_API_KEY` blank — uses Overpass/OSM automatically. Add `YELP_API_KEY` (free at yelp.com/developers) for better coverage.
+
+**Google mode:** set `GOOGLE_MAPS_API_KEY` — best coverage, ~$0.95/POC scan, fits within Google's $200/month free tier.
+
 ## Architecture
 
 ```
 CLI (cli.py)
-  scan ──► places.py  (geocode → Nearby Search → Place Details)
-              │
-              ├── db.py  (upsert businesses, idempotency)
-              │
-              └── checker.py  (async httpx website quality)
+  scan ──► cfg.use_google?
+             YES → places.py  (geocode → Nearby Search → Place Details → DB)
+             NO  → free_sources.py  (Nominatim → Overpass + Yelp → DB)
+           ↓
+           checker.py  (async httpx quality checks → DB)
   report ──► reporter.py  (query DB → CSV)
   stats  ──► reporter.py  (rich table)
 ```
 
-- **`scanner/db.py`** — All SQLite work. Two tables: `businesses` and `website_checks`. `Business` and `WebsiteCheckResult` dataclasses live here.
-- **`scanner/places.py`** — Google Places API. `fetch_area()` is the main entry point: geocodes, runs Nearby Search, fetches Place Details, writes to DB.
-- **`scanner/checker.py`** — Async `httpx` checks with `asyncio.Semaphore(10)`. Returns results to caller; never writes DB directly (thread safety).
-- **`scanner/cli.py`** — Typer app. `scan` command wires all three phases; DB writes from website checks happen in a single transaction after `asyncio.run()` returns.
-- **`scanner/reporter.py`** — Read-only. Generates timestamped CSV files and rich stats table.
-- **`scanner/config.py`** — `load_config()` reads `.env`, validates API key, returns frozen `Config` dataclass.
+**Key files:**
+- `scanner/config.py` — `Config` dataclass; `cfg.use_google` property drives routing in `cli.py`
+- `scanner/db.py` — SQLite CRUD; `Business` + `WebsiteCheckResult` dataclasses
+- `scanner/places.py` — Google Places: geocode (googlemaps lib), Nearby Search, Place Details
+- `scanner/free_sources.py` — Free fallback: Nominatim geocoding, Overpass/OSM, Yelp Fusion
+- `scanner/checker.py` — Async `httpx` checks with `asyncio.Semaphore(10)`; never writes DB
+- `scanner/reporter.py` — Read-only; timestamped CSV files + rich stats table
+- `scanner/cli.py` — Typer app; routes to Google or free sources based on config
 
-## Key constraints (don't change without good reason)
+## Data source details
 
-- **All DB writes on main thread only.** `checker.py` is async-internal but returns results; `cli.py` writes them synchronously. Passing `sqlite3.Connection` into async coroutines causes `ProgrammingError`.
-- **`insert_website_check` + `update_last_checked_at` must be in one transaction.** If they split, staleness checks diverge.
-- **`_paginate_nearby_search` sleeps 2.1 s between pages.** This is a Google API requirement — removing it returns `INVALID_REQUEST`.
-- **Place Details calls are sequential** (not async) with `cfg.place_details_delay_s` between them to stay under 10 QPS. This is intentional for v0 simplicity.
-- **Default radius 1 km, max_results 50.** These are POC-safe defaults. A full St. Pete scan costs ~$55 — don't change defaults without user confirmation.
+### Google Places (places.py)
+- `geocode_area()` → `_paginate_nearby_search()` (3 pages × 20, 2.1 s sleep between pages) → `_fetch_place_details()` sequential with delay
+- Max 60 results per scan (Google API limit); grid scan for more is v1
+- `Business.details_fetched_at` is set after Place Details call
+
+### Free sources (free_sources.py)
+- Nominatim geocoding (1 req/s rate limit — `time.sleep(1)` enforced)
+- Overpass query covers: shop, amenity, craft, office nodes+ways
+- Yelp search result doesn't include business website URL (website=NULL for Yelp results)
+- OSM `website` tag IS included when present
+- Dedup by (name.lower(), lat ±0.0001°, lng ±0.0001°) before DB write
+- `Business.details_fetched_at` is set immediately (no separate enrichment phase for free mode)
+
+## Key constraints (do not change without good reason)
+
+- **All DB writes on main thread only.** `checker.py` returns results; `cli.py` writes them. Passing `sqlite3.Connection` into async coroutines causes `ProgrammingError`.
+- **`insert_website_check` + `update_last_checked_at` must be in one transaction** to prevent staleness divergence.
+- **Google `_paginate_nearby_search` sleeps 2.1 s between pages** — Google API requirement; removing it gives `INVALID_REQUEST`.
+- **Place Details calls are sequential** to stay under 10 QPS. Intentional for v0 simplicity.
+- **Defaults are POC-safe**: 1 km radius, 50 businesses. Full St. Pete costs ~$55 with Google — never expand defaults without user confirmation.
+- **Nominatim 1 req/s limit** — `time.sleep(1)` after geocode call in `free_sources.py` is required by ToS.
 
 ## Database
 
-SQLite at `data/scanner.db` (gitignored, auto-created).
+SQLite at `data/scanner.db` (gitignored, auto-created). Two tables:
 
 ```sql
 -- Key queries
-SELECT * FROM businesses WHERE website IS NULL AND details_fetched_at IS NOT NULL;  -- no-website leads
-SELECT b.*, MAX(wc.score) FROM businesses b JOIN website_checks wc ON wc.place_id = b.place_id WHERE wc.score < 40;  -- poor sites
+SELECT * FROM businesses WHERE website IS NULL AND details_fetched_at IS NOT NULL;
+SELECT b.*, wc.score FROM businesses b JOIN website_checks wc ON wc.place_id = b.place_id
+  WHERE wc.checked_at = (SELECT MAX(wc2.checked_at) FROM website_checks wc2 WHERE wc2.place_id = b.place_id)
+  AND wc.score < 40;
 ```
+
+place_id prefixes: Google = `ChIJ...`, Overpass = `osm_node_*` / `osm_way_*`, Yelp = `yelp_*`
 
 ## Website quality scoring
 
@@ -64,27 +90,22 @@ SELECT b.*, MAX(wc.score) FROM businesses b JOIN website_checks wc ON wc.place_i
 | Has `<title>` | 5 |
 | Has `<meta description>` | 5 |
 
-Score < 40 = poor website lead (flagged in poor_website CSV).
+Score < 40 = poor website lead.
 
 ## Adding new features
 
 **New CLI command:** add `@app.command()` in `cli.py`, import locally to avoid circular imports.
 
-**New website metric:** add constant in `checker.py`, update `compute_score()`, add column to `website_checks` schema in `db.py` (requires schema migration — add `ALTER TABLE` or recreate DB).
+**New website metric:** add constant + logic in `checker.py:compute_score()`. Also add column to `website_checks` in `db.py` schema.
 
-**Full city grid scan (v1):** implement in `places.py` as `fetch_area_grid()`. Use overlapping tiles (lat/lng increments), collect all place_ids, deduplicate by place_id (DB's UNIQUE constraint handles this), then fetch details for new ones.
+**Yelp website URLs (v1):** call `/v3/businesses/{id}` per Yelp result to get `website` field. Costs 1 extra Yelp API call per business but stays within 500/day for POC scale.
 
-## Cost guard
+**Full city grid scan (v1):** implement `fetch_area_grid()` in `places.py` — tile the city bounding box with overlapping 1 km circles, collect all place_ids, let DB dedup handle overlap.
 
-Always set a Google Cloud budget alert before running large scans:
-- 50 businesses ≈ $0.95
-- 300 businesses ≈ $6
-- 2,000 businesses ≈ $55
-
-## Open questions / v1 backlog
+## v1 backlog
 
 1. `--type` filter for Nearby Search (e.g. `restaurant` only)
-2. Grid scan mode for full city coverage
-3. `--refresh` flag to re-fetch stale Place Details
-4. `--db` option to use a separate database per city
-5. `businesses.last_checked_at` is a denormalized cache of `MAX(website_checks.checked_at)` — consider dropping it and always deriving from the checks table
+2. Grid scan for full city coverage
+3. `--refresh` to re-fetch stale Place Details / Overpass data
+4. `--db` option for per-city database isolation
+5. Yelp Business Details calls to get actual website URLs
